@@ -71,6 +71,22 @@ RUN --mount=type=cache,target=/cache/ccache \
     cp $CMAKE_BUILD_DIR/src/fake-udev/fake-udev /wolf/fake-udev
 
 ########################################################
+# The fake-uinput shim is LD_PRELOADed into session containers, whose images come from other
+# distros (the Steam image is Ubuntu-based). Build it against an old glibc with a static C++
+# runtime so it loads in any newer session image. Steam's client is 32-bit, so build both.
+# Only ioctl is exported: a preloaded copy of the C++ runtime would take over every process's own
+# (Steam's web UI stops listing controllers).
+FROM ubuntu:22.04 AS fake-uinput-builder
+RUN apt-get update && apt-get install -y --no-install-recommends g++ g++-multilib && \
+    rm -rf /var/lib/apt/lists/*
+COPY src/fake-uinput/fake-uinput.cpp /src/fake-uinput.cpp
+RUN for bits in 64 32; do \
+      g++ -m$bits -shared -fPIC -O2 -std=c++17 -static-libstdc++ -static-libgcc \
+          -fvisibility=hidden -Wl,--exclude-libs,ALL \
+          -o /libfake-uinput-$bits.so /src/fake-uinput.cpp -ldl; \
+    done
+
+########################################################
 FROM $BASE_IMAGE AS runner
 
 # Wolf runtime dependencies
@@ -129,6 +145,8 @@ RUN mkdir -p $WOLF_CFG_FOLDER
 
 COPY --from=wolf-builder /wolf/wolf /wolf/wolf
 COPY --from=wolf-builder /wolf/fake-udev /wolf/fake-udev
+COPY --from=fake-uinput-builder /libfake-uinput-64.so /wolf/libfake-uinput.so
+COPY --from=fake-uinput-builder /libfake-uinput-32.so /wolf/libfake-uinput-32.so
 
 ENV GST_GL_API=gles2 \
     GST_GL_PLATFORM=egl \

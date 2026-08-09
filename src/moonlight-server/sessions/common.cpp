@@ -71,6 +71,31 @@ void start_runner(std::shared_ptr<events::Runner> runner,
       {std::filesystem::path(args->host->host_base_state_folder) / "fake-udev", "/usr/bin/fake-udev"});
   mounted_paths.push_back({std::filesystem::path(args->app_host_state_folder) / "udev", "/run/udev/"});
 
+  // Apps that opt in (WOLF_FAKE_UINPUT=1, see runners/docker.cpp) can create their own uinput
+  // devices (e.g. Steam Input): give them the fake-uinput shim, the real /dev/uinput and the control
+  // socket. The shim asks Wolf to do the privileged mknod + fake-udev, so the container stays
+  // otherwise unprivileged. See xref dev/fake-uinput.
+  if (runner->needs_fake_uinput()) {
+    // Preload the shim by bare soname, dropping each build into the dirs the loader searches by
+    // default for its arch (Steam spawns both 32- and 64-bit processes): the multiarch dirs on
+    // Debian/Ubuntu images, lib64 and lib on Fedora images. Not via LD_LIBRARY_PATH on purpose: that
+    // would override the app's own and break Steam's runtime. startup.sh ships the libs under
+    // <state>/fake-uinput, like fake-udev above.
+    auto fu_dir = std::filesystem::path(args->host->host_base_state_folder) / "fake-uinput";
+    for (const auto &dir : {"/usr/lib/x86_64-linux-gnu", "/usr/lib64"})
+      mounted_paths.push_back({fu_dir / "lib64/libfake-uinput.so", std::filesystem::path(dir) / "libfake-uinput.so"});
+    for (const auto &dir : {"/usr/lib/i386-linux-gnu", "/usr/lib"})
+      mounted_paths.push_back({fu_dir / "lib32/libfake-uinput.so", std::filesystem::path(dir) / "libfake-uinput.so"});
+    full_env.set("LD_PRELOAD", "libfake-uinput.so");
+
+    if (std::filesystem::exists("/dev/uinput"))
+      all_devices.push_back("/dev/uinput");
+
+    mounted_paths.push_back(
+        {std::filesystem::path(args->host->host_xdg_runtime_dir) / "wolf.sock", "/var/run/wolf/wolf.sock"});
+    full_env.set("WOLF_SOCKET_PATH", "/var/run/wolf/wolf.sock");
+  }
+
   /* Finally run the app, this will stop here until over */
   runner->run(args->session_id,
               args->app_local_state_folder,
