@@ -31,6 +31,11 @@ For those apps Wolf injects a small `LD_PRELOAD` shim (`src/fake-uinput`) that i
 create the shim resolves the new device's sysfs name (`UI_GET_SYSNAME`) and tells Wolf about it over
 the control socket.
 
+Wolf mounts that socket twice, at `/var/run/wolf/wolf-runtime.sock` and `/tmp/.wolf-runtime.sock`,
+and lists both in `WOLF_FAKE_UINPUT_SOCKET`; the shim uses the first one it can connect to. The
+second copy is for apps that run in a sandbox of their own: Steam's 64-bit client runs inside
+pressure-vessel, which gives it a fresh `/run` but shares `/tmp`.
+
 .The endpoints the shim calls
 [source]
 ....

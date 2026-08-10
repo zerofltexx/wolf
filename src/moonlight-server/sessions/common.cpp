@@ -91,9 +91,24 @@ void start_runner(std::shared_ptr<events::Runner> runner,
     if (std::filesystem::exists("/dev/uinput"))
       all_devices.push_back("/dev/uinput");
 
-    mounted_paths.push_back(
-        {std::filesystem::path(args->host->host_xdg_runtime_dir) / "wolf.sock", "/var/run/wolf/wolf.sock"});
-    full_env.set("WOLF_SOCKET_PATH", "/var/run/wolf/wolf.sock");
+    // The restricted socket, not wolf.sock: the shim only needs plug/unplug. Bind mounting a path
+    // that doesn't exist yet makes the runtime create a directory there instead (see wolf#462), so
+    // check first and leave it out rather than handing the app a directory named like a socket.
+    // It goes in twice: under XDG_RUNTIME_DIR like Wolf's other sockets, and in /tmp for apps that
+    // run inside their own sandbox. Steam's 64-bit client runs in pressure-vessel, which gives it a
+    // fresh /run but shares /tmp, so only the /tmp copy is reachable from there. The shim tries the
+    // paths in order.
+    auto runtime_sock = std::filesystem::path(args->host->host_xdg_runtime_dir) / "wolf-runtime.sock";
+    if (std::filesystem::is_socket(runtime_sock)) {
+      mounted_paths.push_back({runtime_sock, "/var/run/wolf/wolf-runtime.sock"});
+      mounted_paths.push_back({runtime_sock, "/tmp/.wolf-runtime.sock"});
+      full_env.set("WOLF_FAKE_UINPUT_SOCKET", "/var/run/wolf/wolf-runtime.sock:/tmp/.wolf-runtime.sock");
+    } else {
+      logs::log(logs::warning,
+                "[FAKE-UINPUT] {} is not a socket, skipping: apps in this session won't be able to "
+                "create their own virtual devices",
+                runtime_sock.string());
+    }
   }
 
   /* Finally run the app, this will stop here until over */

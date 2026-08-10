@@ -2,12 +2,14 @@
 // unprivileged session containers -- the typical case being Steam Input. It hooks only
 // ioctl(UI_DEV_CREATE / UI_DEV_DESTROY); everything else passes straight through, so Wolf's own
 // virtual controllers are untouched. It does no privileged work itself: on create/destroy it
-// notifies Wolf over the control socket (HTTP over the AF_UNIX socket at $WOLF_SOCKET_PATH), and
+// notifies Wolf over the AF_UNIX socket at $WOLF_FAKE_UINPUT_SOCKET, and
 // Wolf does the mknod + fake-udev on the host via the same path it uses for its own virtual pads.
 // So the container needs no privilege, not even CAP_MKNOD.
 //
 // Wolf sets these in the container's env:
-//   WOLF_SOCKET_PATH  - the wolf.sock control API
+//   WOLF_FAKE_UINPUT_SOCKET - Wolf's restricted device plug/unplug socket: one or more paths to
+//                             it, separated by ':', tried in order (an app in its own sandbox,
+//                             like Steam in pressure-vessel, only sees some of them)
 //   WOLF_SESSION_ID   - identifies the session so Wolf injects into the right container
 //
 // Built 64- and 32-bit (Steam's client is 32-bit); both are LD_PRELOAD'd and the loader skips the
@@ -93,31 +95,50 @@ static std::string json_escape(const std::string &s) {
   return o;
 }
 
+// Connects to the first path in the ':'-separated list that accepts, or returns -1.
+// Short timeouts so a wedged Wolf never blocks Steam.
+static int connect_wolf(const char *paths) {
+  std::string failures;
+  const char *p = paths;
+  while (*p) {
+    const char *end = strchr(p, ':');
+    std::string sock = end ? std::string(p, end - p) : std::string(p);
+    p = end ? end + 1 : p + sock.size();
+    if (sock.empty())
+      continue;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+      return -1;
+    struct timeval tv {};
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+    if (connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0)
+      return fd;
+    failures += " " + sock + ": " + strerror(errno) + ";";
+    close(fd);
+  }
+  logline("WARN cannot reach Wolf:" + failures);
+  return -1;
+}
+
 // Minimal HTTP/1.1 POST over the AF_UNIX control socket. Returns the numeric status
-// (e.g. 200) or -1 on transport failure. Short timeouts so a wedged Wolf never blocks Steam.
+// (e.g. 200) or -1 on transport failure.
 static int wolf_post(const std::string &path, const std::string &body) {
-  const char *sock = getenv("WOLF_SOCKET_PATH");
-  if (!sock || !*sock) {
-    logline("WARN WOLF_SOCKET_PATH unset; cannot notify Wolf");
+  const char *socks = getenv("WOLF_FAKE_UINPUT_SOCKET");
+  if (!socks || !*socks) {
+    logline("WARN WOLF_FAKE_UINPUT_SOCKET unset; cannot notify Wolf");
     return -1;
   }
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  int fd = connect_wolf(socks);
   if (fd < 0)
     return -1;
-  struct timeval tv {};
-  tv.tv_sec = 2;
-  tv.tv_usec = 0;
-  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-  struct sockaddr_un addr {};
-  addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
-  if (connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
-    logline(std::string("WARN connect(") + sock + ") failed: " + strerror(errno));
-    close(fd);
-    return -1;
-  }
 
   std::string req = "POST " + path +
                     " HTTP/1.1\r\n"
